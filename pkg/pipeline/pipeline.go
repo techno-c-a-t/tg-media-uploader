@@ -266,12 +266,19 @@ func (p *ProgressTracker) UpdateWithTelemetry(written int64, t *downloader.Downl
 				if s.Status == downloader.StatusStreaming || s.Status == downloader.StatusConnecting {
 					activeCount++
 				}
-				streamParts = append(streamParts, fmt.Sprintf("#%d: %.0f%% [%s]", s.ID, sPct, s.Status))
+				streamParts = append(streamParts, fmt.Sprintf("W#%d: B#%d %.0f%% [%s]", s.ID, s.CurrentBlock, sPct, s.Status))
+			} else {
+				streamParts = append(streamParts, fmt.Sprintf("W#%d: [%s]", s.ID, s.Status))
 			}
 		}
 
-		log.Printf("[Task %s] [%s] 🔌 TCP Sockets: %d open | Active Streams: %d/%d\n   └─ Streams: %s",
-			p.taskID, p.stage, t.OpenTCPConns, activeCount, len(t.Streams), strings.Join(streamParts, "  "))
+		blocksStr := ""
+		if t.TotalBlocks > 0 {
+			blocksStr = fmt.Sprintf(" | Blocks: %d/%d done", t.BlocksDone, t.TotalBlocks)
+		}
+
+		log.Printf("[Task %s] [%s] 🔌 TCP Sockets: %d open%s | Active Workers: %d/%d\n   └─ Workers: %s",
+			p.taskID, p.stage, t.OpenTCPConns, blocksStr, activeCount, len(t.Streams), strings.Join(streamParts, "  "))
 	}
 
 	p.lastLog = now

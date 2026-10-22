@@ -54,9 +54,9 @@ func LoadFromEnv() *Config {
 	}
 	appHash = strings.TrimSpace(appHash)
 
-	chunkSizeMB, _ := strconv.ParseInt(getEnv("CHUNK_SIZE_MB", "500"), 10, 64)
+	chunkSizeMB, _ := strconv.ParseInt(getEnv("CHUNK_SIZE_MB", "100"), 10, 64)
 	if chunkSizeMB <= 0 {
-		chunkSizeMB = 500
+		chunkSizeMB = 100
 	}
 
 	downloadConcurrency, _ := strconv.Atoi(getEnv("CONCURRENT_DOWNLOAD_STREAMS", "8"))
@@ -84,9 +84,9 @@ func LoadFromEnv() *Config {
 		uploadPartSizeKB = 512
 	}
 
-	uploadThreads, _ := strconv.Atoi(getEnv("TG_UPLOAD_THREADS", "4"))
+	uploadThreads, _ := strconv.Atoi(getEnv("TG_UPLOAD_THREADS", "8"))
 	if uploadThreads <= 0 {
-		uploadThreads = 4
+		uploadThreads = 8
 	}
 
 	tempDir := getEnv("TEMP_DIR", "/tmp/tg_file_proxy")
