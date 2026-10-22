@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,6 +37,7 @@ type Client struct {
 	rawAPI     *tg.Client
 	sender     *message.Sender
 	up         *uploader.Uploader
+	pool       telegram.CloseInvoker
 	dispatcher tg.UpdateDispatcher
 	onURL      URLHandler
 }
@@ -96,9 +98,23 @@ func (c *Client) Start(ctx context.Context, f func(ctx context.Context) error) e
 		}
 		threads := c.cfg.UploadThreads
 		if threads <= 0 {
-			threads = 4
+			threads = 8
 		}
-		c.up = uploader.NewUploader(c.rawAPI).WithPartSize(partSize).WithThreads(threads)
+
+		var uploaderClient uploader.Client = c.rawAPI
+		pool, err := c.client.Pool(int64(threads))
+		if err == nil {
+			c.pool = pool
+			uploaderClient = tg.NewClient(pool)
+			log.Printf("[Telegram] 🚀 Initialized MTProto connection pool with up to %d parallel TCP sockets", threads)
+			defer func() {
+				_ = pool.Close()
+			}()
+		} else {
+			log.Printf("[Telegram] ⚠️ Failed to create MTProto connection pool (%v), fallback to single socket", err)
+		}
+
+		c.up = uploader.NewUploader(uploaderClient).WithPartSize(partSize).WithThreads(threads)
 
 		// Register message handlers
 		c.dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
