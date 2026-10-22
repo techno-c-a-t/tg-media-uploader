@@ -116,7 +116,7 @@ func main() {
 		AppHash:     cfg.AppHash,
 		BotToken:    cfg.BotToken,
 		TargetPeer:  cfg.TargetPeer,
-		SessionFile: "tg_session.json",
+		SessionFile: cfg.SessionFile,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize Telegram client: %v", err)

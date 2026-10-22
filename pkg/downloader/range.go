@@ -49,67 +49,87 @@ func NewClient(timeout time.Duration) *Client {
 	}
 }
 
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
 // Probe inspects the remote URL to check file size and Range support.
 func (c *Client) Probe(ctx context.Context, fileURL string) (*FileInfo, error) {
-	// First, try a HEAD request
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, fileURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HEAD request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TgFileProxy/1.0)")
-
-	resp, err := c.httpClient.Do(req)
-	// If HEAD is not supported (405, 403, 501), fallback to GET with Range: bytes=0-0
-	if err != nil || resp.StatusCode >= 400 {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-
-		req, err = http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create GET range probe: %w", err)
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TgFileProxy/1.0)")
-		req.Header.Set("Range", "bytes=0-0")
-
-		resp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute probe request: %w", err)
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("server responded with status %d", resp.StatusCode)
-	}
-
 	info := &FileInfo{
 		URL: fileURL,
 	}
 
-	// 1. Determine Range support
-	acceptRanges := resp.Header.Get("Accept-Ranges")
-	contentRange := resp.Header.Get("Content-Range")
-	if strings.EqualFold(acceptRanges, "bytes") || resp.StatusCode == http.StatusPartialContent || contentRange != "" {
-		info.AcceptRanges = true
+	// 1. Try a HEAD request first
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, fileURL, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", defaultUserAgent)
+		resp, err := c.httpClient.Do(req)
+		if err == nil {
+			info.Filename = extractFilename(resp, fileURL)
+			if strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
+				info.AcceptRanges = true
+			}
+			if resp.ContentLength > 0 {
+				info.Size = resp.ContentLength
+			}
+			_ = resp.Body.Close()
+		}
 	}
 
-	// 2. Determine file size
-	if contentRange != "" {
-		// Content-Range: bytes 0-0/12345678
-		parts := strings.Split(contentRange, "/")
-		if len(parts) == 2 {
-			if totalSize, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil {
-				info.Size = totalSize
+	// 2. If size is 0 or Range unconfirmed, execute GET with Range: bytes=0-0
+	if info.Size <= 0 || !info.AcceptRanges {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create range probe: %w", err)
+		}
+		req.Header.Set("User-Agent", defaultUserAgent)
+		req.Header.Set("Range", "bytes=0-0")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute range probe: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusPartialContent || strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
+			info.AcceptRanges = true
+		}
+
+		if info.Filename == "" {
+			info.Filename = extractFilename(resp, fileURL)
+		}
+
+		cr := resp.Header.Get("Content-Range")
+		if cr != "" {
+			parts := strings.Split(cr, "/")
+			if len(parts) == 2 {
+				if totalSize, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil && totalSize > 0 {
+					info.Size = totalSize
+				}
+			}
+		}
+
+		if info.Size <= 0 && resp.ContentLength > 0 {
+			info.Size = resp.ContentLength
+		}
+	}
+
+	// 3. Fallback: check URL query parameters (e.g. ?full_size=... or ?size=...)
+	if info.Size <= 0 {
+		if parsed, err := url.Parse(fileURL); err == nil {
+			q := parsed.Query()
+			for _, param := range []string{"full_size", "size", "filesize"} {
+				if val := q.Get(param); val != "" {
+					if s, err := strconv.ParseInt(val, 10, 64); err == nil && s > 0 {
+						info.Size = s
+						break
+					}
+				}
 			}
 		}
 	}
-	if info.Size == 0 && resp.ContentLength > 0 {
-		info.Size = resp.ContentLength
-	}
 
-	// 3. Extract filename
-	info.Filename = extractFilename(resp, fileURL)
+	if info.Filename == "" {
+		info.Filename = fmt.Sprintf("file_%d.bin", time.Now().Unix())
+	}
 
 	return info, nil
 }
@@ -129,7 +149,7 @@ func (c *Client) DownloadRange(
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
 	req.Header.Set("Range", rangeHeader)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TgFileProxy/1.0)")
+	req.Header.Set("User-Agent", defaultUserAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

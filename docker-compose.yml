@@ -13,7 +13,7 @@ services:
       - HTTP_PORT=8080
       - TEMP_DIR=/tmp/tg_file_proxy
     volumes:
-      - ./tg_session.json:/app/tg_session.json
+      - ./data:/app/data
       - tg_chunk_cache:/tmp/tg_file_proxy
     # Strict resource isolation: 300MB RAM limit
     deploy:

@@ -17,6 +17,7 @@ type Config struct {
 	ChunkSizeMB int64
 	TempDir     string
 	HTTPPort    string
+	SessionFile string
 }
 
 // LoadFromEnv loads configuration from environment variables and parses local .env if present.
@@ -45,6 +46,15 @@ func LoadFromEnv() *Config {
 	tempDir := getEnv("TEMP_DIR", "/tmp/tg_file_proxy")
 	_ = os.MkdirAll(tempDir, 0755)
 
+	sessionFile := getEnv("TG_SESSION_FILE", "")
+	if sessionFile == "" {
+		if _, err := os.Stat("/app/data"); err == nil {
+			sessionFile = "/app/data/tg_session.json"
+		} else {
+			sessionFile = "tg_session.json"
+		}
+	}
+
 	return &Config{
 		AppID:       appID,
 		AppHash:     appHash,
@@ -54,6 +64,7 @@ func LoadFromEnv() *Config {
 		ChunkSizeMB: chunkSizeMB,
 		TempDir:     tempDir,
 		HTTPPort:    getEnv("HTTP_PORT", "8080"),
+		SessionFile: sessionFile,
 	}
 }
 
