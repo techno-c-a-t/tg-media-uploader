@@ -12,13 +12,16 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -39,11 +42,46 @@ type ClientOptions struct {
 	MaxRetries int
 }
 
-// Client wraps an HTTP client with sensible defaults and high-throughput connection pooling.
+// StreamStatus represents the lifecycle state of a parallel download stream.
+type StreamStatus string
+
+const (
+	StatusConnecting   StreamStatus = "CONNECT"
+	StatusTLSHandshake StreamStatus = "TLS"
+	StatusStreaming    StreamStatus = "STREAM"
+	StatusRetrying     StreamStatus = "RETRY"
+	StatusDone         StreamStatus = "DONE"
+	StatusError        StreamStatus = "ERR"
+)
+
+// StreamProgress represents telemetry for an individual parallel stream.
+type StreamProgress struct {
+	ID        int
+	Start     int64
+	End       int64
+	Written   int64
+	Total     int64
+	Status    StreamStatus
+	ReusedTCP bool
+}
+
+// DownloadTelemetry provides real-time metrics across all parallel streams and TCP sockets.
+type DownloadTelemetry struct {
+	TotalWritten int64
+	TotalSize    int64
+	OpenTCPConns int64
+	Streams      []StreamProgress
+}
+
+// DownloadProgressFunc is invoked periodically with progress and stream-level telemetry.
+type DownloadProgressFunc func(written, total int64, telemetry *DownloadTelemetry)
+
+// Client wraps an HTTP client with high-throughput connection pooling and socket tuning.
 type Client struct {
-	httpClient *http.Client
-	userAgent  string
-	maxRetries int
+	httpClient   *http.Client
+	userAgent    string
+	maxRetries   int
+	openTCPConns int64
 }
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -53,7 +91,7 @@ func NewClient(timeout time.Duration) *Client {
 	return NewClientWithOptions(ClientOptions{Timeout: timeout})
 }
 
-// NewClientWithOptions creates a new downloader client with customizable options.
+// NewClientWithOptions creates a new downloader client with customizable options and FDM-style socket tuning.
 func NewClientWithOptions(opts ClientOptions) *Client {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 45 * time.Minute
@@ -70,13 +108,20 @@ func NewClientWithOptions(opts ClientOptions) *Client {
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
+			Control: func(network, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					// Free Download Manager (FDM) optimization:
+					// Expand socket receive buffer (SO_RCVBUF) to 512 KB to prevent kernel packet drops on high-bandwidth WAN connections
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 512*1024)
+				})
+			},
 		}).DialContext,
 		ForceAttemptHTTP2: false,
-		// CRITICAL: Disable HTTP/2 multiplexing so each worker establishes an independent TCP connection!
-		// If HTTP/2 is enabled, Go multiplexes all streams over a single TCP connection, causing CDN rate limits to throttle all streams together.
+		// CRITICAL: Disable HTTP/2 multiplexing so each stream opens a separate TCP socket.
+		// If HTTP/2 is enabled, Go multiplexes all streams over a single TCP socket, causing CDN rate limits to throttle all streams together.
 		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   32, // Essential for multiple parallel streams to the same host!
+		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -195,7 +240,7 @@ func (c *Client) DownloadRange(
 	fileURL string,
 	start, end int64,
 	destPath string,
-	onProgress func(written, total int64),
+	onProgress DownloadProgressFunc,
 ) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
@@ -230,7 +275,7 @@ func (c *Client) DownloadRange(
 	targetSize := end - start + 1
 	var written int64
 
-	buf := make([]byte, 64*1024)
+	buf := make([]byte, 256*1024)
 
 	for {
 		select {
@@ -248,7 +293,14 @@ func (c *Client) DownloadRange(
 			hasher.Write(buf[0:nr])
 			written += int64(nw)
 			if onProgress != nil {
-				onProgress(written, targetSize)
+				onProgress(written, targetSize, &DownloadTelemetry{
+					TotalWritten: written,
+					TotalSize:    targetSize,
+					OpenTCPConns: 1,
+					Streams: []StreamProgress{
+						{ID: 1, Start: start, End: end, Written: written, Total: targetSize, Status: StatusStreaming},
+					},
+				})
 			}
 		}
 
@@ -271,14 +323,13 @@ func (c *Client) DownloadRangeParallel(
 	start, end int64,
 	destPath string,
 	concurrency int,
-	onProgress func(written, total int64),
+	onProgress DownloadProgressFunc,
 ) (string, error) {
 	totalSize := end - start + 1
 	if totalSize <= 0 {
 		return "", errors.New("invalid byte range: total size <= 0")
 	}
 
-	// For tiny chunks or concurrency 1, single stream is faster and simpler
 	if concurrency <= 1 || totalSize < 2*1024*1024 {
 		return c.DownloadRange(ctx, fileURL, start, end, destPath, onProgress)
 	}
@@ -317,9 +368,10 @@ func (c *Client) DownloadRangeParallel(
 	g, gCtx := errgroup.WithContext(ctx)
 
 	var writtenTotal int64
+	streams := make([]*StreamProgress, concurrency)
+	var streamMu sync.Mutex
 
 	for w := 0; w < concurrency; w++ {
-		w := w
 		wStart := start + int64(w)*subSize
 		if wStart > end {
 			break
@@ -330,11 +382,36 @@ func (c *Client) DownloadRangeParallel(
 		}
 		fileOffset := wStart - start
 
+		sp := &StreamProgress{
+			ID:     w + 1,
+			Start:  wStart,
+			End:    wEnd,
+			Total:  wEnd - wStart + 1,
+			Status: StatusConnecting,
+		}
+		streams[w] = sp
+
+		wIdx := w
 		g.Go(func() error {
-			return c.downloadSegmentWithRetry(gCtx, fileURL, wStart, wEnd, file, fileOffset, func(n int64) {
+			return c.downloadSegmentWithRetry(gCtx, fileURL, wStart, wEnd, file, fileOffset, streams[wIdx], &streamMu, func(n int64) {
 				tot := atomic.AddInt64(&writtenTotal, n)
 				if onProgress != nil {
-					onProgress(tot, totalSize)
+					streamMu.Lock()
+					snapshot := make([]StreamProgress, len(streams))
+					for i, s := range streams {
+						if s != nil {
+							snapshot[i] = *s
+							snapshot[i].Written = atomic.LoadInt64(&s.Written)
+						}
+					}
+					streamMu.Unlock()
+
+					onProgress(tot, totalSize, &DownloadTelemetry{
+						TotalWritten: tot,
+						TotalSize:    totalSize,
+						OpenTCPConns: atomic.LoadInt64(&c.openTCPConns),
+						Streams:      snapshot,
+					})
 				}
 			})
 		})
@@ -368,6 +445,8 @@ func (c *Client) downloadSegmentWithRetry(
 	start, end int64,
 	file *os.File,
 	fileOffset int64,
+	stream *StreamProgress,
+	streamMu *sync.Mutex,
 	onBytesWritten func(n int64),
 ) error {
 	maxRetries := c.maxRetries
@@ -387,6 +466,9 @@ func (c *Client) downloadSegmentWithRetry(
 		}
 
 		if attempt > 0 {
+			streamMu.Lock()
+			stream.Status = StatusRetrying
+			streamMu.Unlock()
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
 
@@ -399,15 +481,44 @@ func (c *Client) downloadSegmentWithRetry(
 		req.Header.Set("Range", rangeHeader)
 		req.Header.Set("User-Agent", c.getUserAgent())
 
+		// Real-time TCP socket and connection lifecycle tracing
+		trace := &httptrace.ClientTrace{
+			ConnectStart: func(network, addr string) {
+				streamMu.Lock()
+				stream.Status = StatusConnecting
+				streamMu.Unlock()
+			},
+			TLSHandshakeStart: func() {
+				streamMu.Lock()
+				stream.Status = StatusTLSHandshake
+				streamMu.Unlock()
+			},
+			GotConn: func(info httptrace.GotConnInfo) {
+				atomic.AddInt64(&c.openTCPConns, 1)
+				streamMu.Lock()
+				stream.ReusedTCP = info.Reused
+				stream.Status = StatusStreaming
+				streamMu.Unlock()
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
+
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			log.Printf("[Stream %s] ⚠️ Attempt %d/%d network error: %v. Retrying...", rangeHeader, attempt+1, maxRetries, err)
+			streamMu.Lock()
+			stream.Status = StatusRetrying
+			streamMu.Unlock()
+			log.Printf("[Stream #%d %s] ⚠️ Attempt %d/%d network error: %v. Retrying...", stream.ID, rangeHeader, attempt+1, maxRetries, err)
 			continue
 		}
 
 		if resp.StatusCode != http.StatusPartialContent {
 			_ = resp.Body.Close()
+			atomic.AddInt64(&c.openTCPConns, -1)
+			streamMu.Lock()
+			stream.Status = StatusError
+			streamMu.Unlock()
 			if resp.StatusCode == http.StatusForbidden {
 				return fmt.Errorf("HTTP 403 Forbidden for range %s (remote URL signature/token has expired!)", rangeHeader)
 			}
@@ -416,7 +527,11 @@ func (c *Client) downloadSegmentWithRetry(
 
 		buf := make([]byte, 256*1024)
 		readLoopErr := func() error {
-			defer resp.Body.Close()
+			defer func() {
+				_ = resp.Body.Close()
+				atomic.AddInt64(&c.openTCPConns, -1)
+			}()
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -432,6 +547,7 @@ func (c *Client) downloadSegmentWithRetry(
 					}
 					curOffset += int64(nr)
 					curStart += int64(nr)
+					atomic.AddInt64(&stream.Written, int64(nr))
 					if onBytesWritten != nil {
 						onBytesWritten(int64(nr))
 					}
@@ -447,14 +563,20 @@ func (c *Client) downloadSegmentWithRetry(
 		}()
 
 		if readLoopErr == nil {
+			streamMu.Lock()
+			stream.Status = StatusDone
+			streamMu.Unlock()
 			return nil
 		}
 
 		lastErr = readLoopErr
-		log.Printf("[Stream %s] ⚠️ Read interrupted at byte %d (%v). Resuming next attempt from byte %d...",
-			rangeHeader, curStart, readLoopErr, curStart)
-		// If read broke midway, curStart and curOffset have advanced, so next retry continues where it left off!
+		log.Printf("[Stream #%d %s] ⚠️ Read interrupted at byte %d (%v). Resuming next attempt from byte %d...",
+			stream.ID, rangeHeader, curStart, readLoopErr, curStart)
 	}
+
+	streamMu.Lock()
+	stream.Status = StatusError
+	streamMu.Unlock()
 
 	return fmt.Errorf("segment bytes=%d-%d failed after %d attempts: %w", start, end, maxRetries, lastErr)
 }

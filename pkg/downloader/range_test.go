@@ -111,7 +111,7 @@ func TestParallelDownload(t *testing.T) {
 		testDataSize-1,
 		outPath,
 		8,
-		func(written, total int64) {
+		func(written, total int64, t *downloader.DownloadTelemetry) {
 			progressCalls++
 		},
 	)

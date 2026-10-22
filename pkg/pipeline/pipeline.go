@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,8 +118,8 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 			endByte,
 			tempFilePath,
 			o.cfg.DownloadConcurrency,
-			func(written, total int64) {
-				downTracker.Update(written)
+			func(written, total int64, t *downloader.DownloadTelemetry) {
+				downTracker.UpdateWithTelemetry(written, t)
 			},
 		)
 		if err != nil {
@@ -221,6 +222,10 @@ func newProgressTracker(taskID, stage string, partIdx, totalParts int, totalByte
 }
 
 func (p *ProgressTracker) Update(written int64) {
+	p.UpdateWithTelemetry(written, nil)
+}
+
+func (p *ProgressTracker) UpdateWithTelemetry(written int64, t *downloader.DownloadTelemetry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -251,6 +256,23 @@ func (p *ProgressTracker) Update(written int64) {
 		p.taskID, p.stage, p.partIdx, p.totalParts,
 		float64(written)/(1024*1024), float64(p.totalBytes)/(1024*1024),
 		pct, speedMBs, etaStr)
+
+	if t != nil && len(t.Streams) > 0 {
+		var activeCount int
+		var streamParts []string
+		for _, s := range t.Streams {
+			if s.Total > 0 {
+				sPct := float64(s.Written) / float64(s.Total) * 100.0
+				if s.Status == downloader.StatusStreaming || s.Status == downloader.StatusConnecting {
+					activeCount++
+				}
+				streamParts = append(streamParts, fmt.Sprintf("#%d: %.0f%% [%s]", s.ID, sPct, s.Status))
+			}
+		}
+
+		log.Printf("[Task %s] [%s] 🔌 TCP Sockets: %d open | Active Streams: %d/%d\n   └─ Streams: %s",
+			p.taskID, p.stage, t.OpenTCPConns, activeCount, len(t.Streams), strings.Join(streamParts, "  "))
+	}
 
 	p.lastLog = now
 }
