@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -69,7 +70,10 @@ func NewClientWithOptions(opts ClientOptions) *Client {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2: false,
+		// CRITICAL: Disable HTTP/2 multiplexing so each worker establishes an independent TCP connection!
+		// If HTTP/2 is enabled, Go multiplexes all streams over a single TCP connection, causing CDN rate limits to throttle all streams together.
+		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32, // Essential for multiple parallel streams to the same host!
 		IdleConnTimeout:       90 * time.Second,
@@ -405,7 +409,7 @@ func (c *Client) downloadSegmentWithRetry(
 			return fmt.Errorf("unexpected status %d for range %s", resp.StatusCode, rangeHeader)
 		}
 
-		buf := make([]byte, 64*1024)
+		buf := make([]byte, 256*1024)
 		readLoopErr := func() error {
 			defer resp.Body.Close()
 			for {
