@@ -6,21 +6,16 @@ services:
     container_name: tg_file_proxy
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${HOST_PORT:-8088}:8080"
+    env_file:
+      - .env
     environment:
-      - TG_APP_ID=${TG_APP_ID:-${API_ID}}
-      - TG_APP_HASH=${TG_APP_HASH:-${API_HASH}}
-      - API_ID=${API_ID:-${TG_APP_ID}}
-      - API_HASH=${API_HASH:-${TG_APP_HASH}}
-      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
-      - TG_PEER=${TG_PEER:-self}
-      - CHUNK_SIZE_MB=${CHUNK_SIZE_MB:-500}
       - HTTP_PORT=8080
       - TEMP_DIR=/tmp/tg_file_proxy
     volumes:
       - ./tg_session.json:/app/tg_session.json
       - tg_chunk_cache:/tmp/tg_file_proxy
-    # Strict resource isolation: 300MB RAM limit, leaves 3.7GB for friend & system
+    # Strict resource isolation: 300MB RAM limit
     deploy:
       resources:
         limits:
