@@ -27,9 +27,13 @@ type Orchestrator struct {
 // NewOrchestrator creates a new pipeline orchestrator.
 func NewOrchestrator(cfg *config.Config, tgClient telegram.Uploader) *Orchestrator {
 	return &Orchestrator{
-		cfg:        cfg,
-		downloader: downloader.NewClient(45 * time.Minute),
-		tgClient:   tgClient,
+		cfg: cfg,
+		downloader: downloader.NewClientWithOptions(downloader.ClientOptions{
+			Timeout:    time.Duration(cfg.DownloadTimeoutMin) * time.Minute,
+			UserAgent:  cfg.DownloadUserAgent,
+			MaxRetries: cfg.DownloadMaxRetries,
+		}),
+		tgClient: tgClient,
 	}
 }
 

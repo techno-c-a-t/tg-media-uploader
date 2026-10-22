@@ -17,11 +17,13 @@ import (
 
 // Config holds Telegram connection credentials.
 type Config struct {
-	AppID       int
-	AppHash     string
-	BotToken    string
-	SessionFile string
-	TargetPeer  string // e.g. "@my_private_channel" or empty for Saved Messages
+	AppID            int
+	AppHash          string
+	BotToken         string
+	SessionFile      string
+	TargetPeer       string // e.g. "@my_private_channel" or empty for Saved Messages
+	UploadPartSizeKB int
+	UploadThreads    int
 }
 
 // URLHandler is called when a URL is sent to the bot.
@@ -87,7 +89,16 @@ func (c *Client) Start(ctx context.Context, f func(ctx context.Context) error) e
 
 		c.rawAPI = c.client.API()
 		c.sender = message.NewSender(c.rawAPI)
-		c.up = uploader.NewUploader(c.rawAPI).WithPartSize(512 * 1024) // 512 KB chunks for MTProto upload
+
+		partSize := c.cfg.UploadPartSizeKB * 1024
+		if partSize <= 0 {
+			partSize = 512 * 1024
+		}
+		threads := c.cfg.UploadThreads
+		if threads <= 0 {
+			threads = 4
+		}
+		c.up = uploader.NewUploader(c.rawAPI).WithPartSize(partSize).WithThreads(threads)
 
 		// Register message handlers
 		c.dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {

@@ -30,17 +30,37 @@ type FileInfo struct {
 	Filename     string
 }
 
+// ClientOptions allows custom tuning for the downloader client.
+type ClientOptions struct {
+	Timeout    time.Duration
+	UserAgent  string
+	MaxRetries int
+}
+
 // Client wraps an HTTP client with sensible defaults and high-throughput connection pooling.
 type Client struct {
 	httpClient *http.Client
+	userAgent  string
+	maxRetries int
 }
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
-// NewClient creates a new downloader client with connection pooling optimized for multi-stream downloads.
+// NewClient creates a new downloader client with default options and the specified timeout.
 func NewClient(timeout time.Duration) *Client {
-	if timeout <= 0 {
-		timeout = 45 * time.Minute
+	return NewClientWithOptions(ClientOptions{Timeout: timeout})
+}
+
+// NewClientWithOptions creates a new downloader client with customizable options.
+func NewClientWithOptions(opts ClientOptions) *Client {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 45 * time.Minute
+	}
+	if opts.UserAgent == "" {
+		opts.UserAgent = defaultUserAgent
+	}
+	if opts.MaxRetries <= 0 {
+		opts.MaxRetries = 3
 	}
 
 	transport := &http.Transport{
@@ -61,7 +81,7 @@ func NewClient(timeout time.Duration) *Client {
 	return &Client{
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   timeout,
+			Timeout:   opts.Timeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 10 {
 					return errors.New("stopped after 10 redirects")
@@ -69,7 +89,16 @@ func NewClient(timeout time.Duration) *Client {
 				return nil
 			},
 		},
+		userAgent:  opts.UserAgent,
+		maxRetries: opts.MaxRetries,
 	}
+}
+
+func (c *Client) getUserAgent() string {
+	if c.userAgent != "" {
+		return c.userAgent
+	}
+	return defaultUserAgent
 }
 
 // Probe inspects the remote URL to check file size and Range support.
@@ -81,7 +110,7 @@ func (c *Client) Probe(ctx context.Context, fileURL string) (*FileInfo, error) {
 	// 1. Try a HEAD request first
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, fileURL, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", defaultUserAgent)
+		req.Header.Set("User-Agent", c.getUserAgent())
 		resp, err := c.httpClient.Do(req)
 		if err == nil {
 			info.Filename = extractFilename(resp, fileURL)
@@ -101,7 +130,7 @@ func (c *Client) Probe(ctx context.Context, fileURL string) (*FileInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create range probe: %w", err)
 		}
-		req.Header.Set("User-Agent", defaultUserAgent)
+		req.Header.Set("User-Agent", c.getUserAgent())
 		req.Header.Set("Range", "bytes=0-0")
 
 		resp, err := c.httpClient.Do(req)
@@ -170,7 +199,7 @@ func (c *Client) DownloadRange(
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
 	req.Header.Set("Range", rangeHeader)
-	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("User-Agent", c.getUserAgent())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -336,7 +365,10 @@ func (c *Client) downloadSegmentWithRetry(
 	fileOffset int64,
 	onBytesWritten func(n int64),
 ) error {
-	const maxRetries = 3
+	maxRetries := c.maxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
 	var lastErr error
 
 	curStart := start
@@ -360,7 +392,7 @@ func (c *Client) downloadSegmentWithRetry(
 
 		rangeHeader := fmt.Sprintf("bytes=%d-%d", curStart, end)
 		req.Header.Set("Range", rangeHeader)
-		req.Header.Set("User-Agent", defaultUserAgent)
+		req.Header.Set("User-Agent", c.getUserAgent())
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {

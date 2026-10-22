@@ -31,6 +31,14 @@ func main() {
 		cfg.ChunkSizeMB = *chunkMBFlag
 	}
 
+	log.Println("⚙️  Configuration loaded:")
+	log.Printf("   • Download Concurrency: %d streams", cfg.DownloadConcurrency)
+	log.Printf("   • Chunk Size: %d MB", cfg.ChunkSizeMB)
+	log.Printf("   • Download Timeout: %d min (retries: %d)", cfg.DownloadTimeoutMin, cfg.DownloadMaxRetries)
+	log.Printf("   • Telegram Upload: %d KB blocks, %d threads", cfg.UploadPartSizeKB, cfg.UploadThreads)
+	log.Printf("   • Target Peer: %s", cfg.TargetPeer)
+	log.Printf("   • Server Port: :%s (Host: :%s)", cfg.HTTPPort, cfg.HostPort)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -112,11 +120,13 @@ func main() {
 	}
 
 	tgClient, err := telegram.NewClient(telegram.Config{
-		AppID:       cfg.AppID,
-		AppHash:     cfg.AppHash,
-		BotToken:    cfg.BotToken,
-		TargetPeer:  cfg.TargetPeer,
-		SessionFile: cfg.SessionFile,
+		AppID:            cfg.AppID,
+		AppHash:          cfg.AppHash,
+		BotToken:         cfg.BotToken,
+		TargetPeer:       cfg.TargetPeer,
+		SessionFile:      cfg.SessionFile,
+		UploadPartSizeKB: cfg.UploadPartSizeKB,
+		UploadThreads:    cfg.UploadThreads,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize Telegram client: %v", err)
