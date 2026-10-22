@@ -9,15 +9,16 @@ import (
 
 // Config represents service settings.
 type Config struct {
-	AppID       int
-	AppHash     string
-	BotToken    string
-	Phone       string
-	TargetPeer  string
-	ChunkSizeMB int64
-	TempDir     string
-	HTTPPort    string
-	SessionFile string
+	AppID               int
+	AppHash             string
+	BotToken            string
+	Phone               string
+	TargetPeer          string
+	ChunkSizeMB         int64
+	DownloadConcurrency int
+	TempDir             string
+	HTTPPort            string
+	SessionFile         string
 }
 
 // LoadFromEnv loads configuration from environment variables and parses local .env if present.
@@ -43,6 +44,14 @@ func LoadFromEnv() *Config {
 		chunkSizeMB = 500
 	}
 
+	downloadConcurrency, _ := strconv.Atoi(getEnv("CONCURRENT_DOWNLOAD_STREAMS", "8"))
+	if downloadConcurrency <= 0 {
+		downloadConcurrency = 8
+	}
+	if downloadConcurrency > 32 {
+		downloadConcurrency = 32
+	}
+
 	tempDir := getEnv("TEMP_DIR", "/tmp/tg_file_proxy")
 	_ = os.MkdirAll(tempDir, 0755)
 
@@ -56,15 +65,16 @@ func LoadFromEnv() *Config {
 	}
 
 	return &Config{
-		AppID:       appID,
-		AppHash:     appHash,
-		BotToken:    strings.TrimSpace(getEnv("TG_BOT_TOKEN", "")),
-		Phone:       strings.TrimSpace(getEnv("TG_PHONE", "")),
-		TargetPeer:  strings.TrimSpace(getEnv("TG_PEER", "self")),
-		ChunkSizeMB: chunkSizeMB,
-		TempDir:     tempDir,
-		HTTPPort:    getEnv("HTTP_PORT", "8080"),
-		SessionFile: sessionFile,
+		AppID:               appID,
+		AppHash:             appHash,
+		BotToken:            strings.TrimSpace(getEnv("TG_BOT_TOKEN", "")),
+		Phone:               strings.TrimSpace(getEnv("TG_PHONE", "")),
+		TargetPeer:          strings.TrimSpace(getEnv("TG_PEER", "self")),
+		ChunkSizeMB:         chunkSizeMB,
+		DownloadConcurrency: downloadConcurrency,
+		TempDir:             tempDir,
+		HTTPPort:            getEnv("HTTP_PORT", "8080"),
+		SessionFile:         sessionFile,
 	}
 }
 

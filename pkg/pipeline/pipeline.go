@@ -89,11 +89,19 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 		chunkName := fmt.Sprintf("%s.part_%04d", info.Filename, i)
 		tempFilePath := filepath.Join(o.cfg.TempDir, fmt.Sprintf("%s_part_%04d.tmp", taskID, i))
 
-		log.Printf("[Task %s] Downloading part %d/%d (%d MB)...",
-			taskID, i+1, totalParts, partSize/(1024*1024))
+		log.Printf("[Task %s] Downloading part %d/%d (%d MB) using %d parallel streams...",
+			taskID, i+1, totalParts, partSize/(1024*1024), o.cfg.DownloadConcurrency)
 
-		// 1. Download chunk via HTTP Range
-		md5Hash, err := o.downloader.DownloadRange(ctx, fileURL, startByte, endByte, tempFilePath, nil)
+		// 1. Download chunk via parallel HTTP Range requests
+		md5Hash, err := o.downloader.DownloadRangeParallel(
+			ctx,
+			fileURL,
+			startByte,
+			endByte,
+			tempFilePath,
+			o.cfg.DownloadConcurrency,
+			nil,
+		)
 		if err != nil {
 			_ = os.Remove(tempFilePath)
 			return nil, fmt.Errorf("failed downloading part %d: %w", i, err)

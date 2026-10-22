@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,7 +16,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // FileInfo holds metadata about a remote file.
@@ -26,19 +30,38 @@ type FileInfo struct {
 	Filename     string
 }
 
-// Client wraps an HTTP client with sensible defaults.
+// Client wraps an HTTP client with sensible defaults and high-throughput connection pooling.
 type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a new downloader client.
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+// NewClient creates a new downloader client with connection pooling optimized for multi-stream downloads.
 func NewClient(timeout time.Duration) *Client {
 	if timeout <= 0 {
-		timeout = 30 * time.Minute
+		timeout = 45 * time.Minute
 	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32, // Essential for multiple parallel streams to the same host!
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
 	return &Client{
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Transport: transport,
+			Timeout:   timeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 10 {
 					return errors.New("stopped after 10 redirects")
@@ -48,8 +71,6 @@ func NewClient(timeout time.Duration) *Client {
 		},
 	}
 }
-
-const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
 // Probe inspects the remote URL to check file size and Range support.
 func (c *Client) Probe(ctx context.Context, fileURL string) (*FileInfo, error) {
@@ -134,7 +155,7 @@ func (c *Client) Probe(ctx context.Context, fileURL string) (*FileInfo, error) {
 	return info, nil
 }
 
-// DownloadRange downloads a specific byte range and streams it directly to destPath while computing MD5.
+// DownloadRange downloads a specific byte range in a single stream.
 func (c *Client) DownloadRange(
 	ctx context.Context,
 	fileURL string,
@@ -161,7 +182,6 @@ func (c *Client) DownloadRange(
 		return "", fmt.Errorf("unexpected status %d for range %s", resp.StatusCode, rangeHeader)
 	}
 
-	// Ensure destination directory exists
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return "", fmt.Errorf("failed to create destination dir: %w", err)
 	}
@@ -176,7 +196,7 @@ func (c *Client) DownloadRange(
 	targetSize := end - start + 1
 	var written int64
 
-	buf := make([]byte, 64*1024) // 64 KB buffer (extremely light on RAM)
+	buf := make([]byte, 64*1024)
 
 	for {
 		select {
@@ -209,12 +229,198 @@ func (c *Client) DownloadRange(
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
+// DownloadRangeParallel downloads a range [start, end] into destPath using multiple concurrent connections.
+// If concurrency <= 1 or size < 2MB, it falls back to single-stream DownloadRange.
+func (c *Client) DownloadRangeParallel(
+	ctx context.Context,
+	fileURL string,
+	start, end int64,
+	destPath string,
+	concurrency int,
+	onProgress func(written, total int64),
+) (string, error) {
+	totalSize := end - start + 1
+	if totalSize <= 0 {
+		return "", errors.New("invalid byte range: total size <= 0")
+	}
+
+	// For tiny chunks or concurrency 1, single stream is faster and simpler
+	if concurrency <= 1 || totalSize < 2*1024*1024 {
+		return c.DownloadRange(ctx, fileURL, start, end, destPath, onProgress)
+	}
+
+	if concurrency > 32 {
+		concurrency = 32
+	}
+
+	// Avoid excessive segmentation on small chunks (min segment: 512 KB)
+	if totalSize/int64(concurrency) < 512*1024 {
+		concurrency = int(totalSize / (512 * 1024))
+		if concurrency < 1 {
+			concurrency = 1
+		}
+	}
+
+	if concurrency <= 1 {
+		return c.DownloadRange(ctx, fileURL, start, end, destPath, onProgress)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return "", fmt.Errorf("failed to create destination dir: %w", err)
+	}
+
+	file, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return "", fmt.Errorf("failed to open destination file: %w", err)
+	}
+	defer file.Close()
+
+	if err := file.Truncate(totalSize); err != nil {
+		return "", fmt.Errorf("failed to pre-allocate file: %w", err)
+	}
+
+	subSize := (totalSize + int64(concurrency) - 1) / int64(concurrency)
+	g, gCtx := errgroup.WithContext(ctx)
+
+	var writtenTotal int64
+
+	for w := 0; w < concurrency; w++ {
+		w := w
+		wStart := start + int64(w)*subSize
+		if wStart > end {
+			break
+		}
+		wEnd := wStart + subSize - 1
+		if wEnd > end {
+			wEnd = end
+		}
+		fileOffset := wStart - start
+
+		g.Go(func() error {
+			return c.downloadSegmentWithRetry(gCtx, fileURL, wStart, wEnd, file, fileOffset, func(n int64) {
+				tot := atomic.AddInt64(&writtenTotal, n)
+				if onProgress != nil {
+					onProgress(tot, totalSize)
+				}
+			})
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return "", err
+	}
+
+	if err := file.Sync(); err != nil {
+		return "", fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Compute MD5 hash via sequential streaming
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("failed to seek destination file: %w", err)
+	}
+
+	hasher := md5.New()
+	buf := make([]byte, 1024*1024) // 1MB buffer for fast sequential MD5
+	if _, err := io.CopyBuffer(hasher, file, buf); err != nil {
+		return "", fmt.Errorf("failed to compute file MD5: %w", err)
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func (c *Client) downloadSegmentWithRetry(
+	ctx context.Context,
+	fileURL string,
+	start, end int64,
+	file *os.File,
+	fileOffset int64,
+	onBytesWritten func(n int64),
+) error {
+	const maxRetries = 3
+	var lastErr error
+
+	curStart := start
+	curOffset := fileOffset
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create segment request: %w", err)
+		}
+
+		rangeHeader := fmt.Sprintf("bytes=%d-%d", curStart, end)
+		req.Header.Set("Range", rangeHeader)
+		req.Header.Set("User-Agent", defaultUserAgent)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusPartialContent {
+			_ = resp.Body.Close()
+			return fmt.Errorf("unexpected status %d for range %s", resp.StatusCode, rangeHeader)
+		}
+
+		buf := make([]byte, 64*1024)
+		readLoopErr := func() error {
+			defer resp.Body.Close()
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+
+				nr, rErr := resp.Body.Read(buf)
+				if nr > 0 {
+					_, writeErr := file.WriteAt(buf[:nr], curOffset)
+					if writeErr != nil {
+						return writeErr
+					}
+					curOffset += int64(nr)
+					curStart += int64(nr)
+					if onBytesWritten != nil {
+						onBytesWritten(int64(nr))
+					}
+				}
+
+				if rErr != nil {
+					if rErr == io.EOF {
+						return nil
+					}
+					return rErr
+				}
+			}
+		}()
+
+		if readLoopErr == nil {
+			return nil
+		}
+
+		lastErr = readLoopErr
+		// If read broke midway, curStart and curOffset have advanced, so next retry continues where it left off!
+	}
+
+	return fmt.Errorf("segment bytes=%d-%d failed after %d attempts: %w", start, end, maxRetries, lastErr)
+}
+
 func extractFilename(resp *http.Response, fileURL string) string {
 	cd := resp.Header.Get("Content-Disposition")
 	if cd != "" {
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
 			if filename, ok := params["filename*"]; ok {
-				// Handle UTF-8''encoded names if present
 				parts := strings.SplitN(filename, "''", 2)
 				if len(parts) == 2 {
 					if decoded, err := url.PathUnescape(parts[1]); err == nil {
