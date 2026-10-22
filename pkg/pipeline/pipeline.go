@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"tg_file_proxy/config"
@@ -37,14 +38,23 @@ func NewOrchestrator(cfg *config.Config, tgClient telegram.Uploader) *Orchestrat
 	}
 }
 
-// ProcessURL processes a single download-and-upload task.
+// ProcessURL processes a single download-and-upload task with comprehensive tracing and live progress.
 func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifest.Manifest, error) {
-	log.Printf("[Pipeline] Probing URL: %s", fileURL)
+	taskID := generateTaskID()
+	overallStartTime := time.Now()
 
+	log.Printf("[Task %s] 🔍 Probing remote URL: %s", taskID, fileURL)
+
+	probeStart := time.Now()
 	info, err := o.downloader.Probe(ctx, fileURL)
 	if err != nil {
+		log.Printf("[Task %s] ❌ Probe failed after %v: %v", taskID, time.Since(probeStart).Round(time.Millisecond), err)
 		return nil, fmt.Errorf("probe failed: %w", err)
 	}
+
+	log.Printf("[Task %s] 📋 Probe result in %v: filename='%s', size=%.2f MB (%d bytes), acceptRanges=%v",
+		taskID, time.Since(probeStart).Round(time.Millisecond), info.Filename,
+		float64(info.Size)/(1024*1024), info.Size, info.AcceptRanges)
 
 	if !info.AcceptRanges {
 		return nil, fmt.Errorf("server does not support HTTP Range requests for %s", fileURL)
@@ -54,15 +64,14 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 		return nil, fmt.Errorf("unknown file size for %s", fileURL)
 	}
 
-	taskID := generateTaskID()
 	chunkSize := o.cfg.ChunkSizeMB * 1024 * 1024
 	totalParts := int((info.Size + chunkSize - 1) / chunkSize)
 
-	log.Printf("[Task %s] File: %s | Size: %.2f MB | Chunks: %d x %d MB",
-		taskID, info.Filename, float64(info.Size)/(1024*1024), totalParts, o.cfg.ChunkSizeMB)
+	log.Printf("[Task %s] 🚀 Task Initialized: File='%s' | Total Size=%.2f MB | Chunks=%d x %d MB | Streams=%d",
+		taskID, info.Filename, float64(info.Size)/(1024*1024), totalParts, o.cfg.ChunkSizeMB, o.cfg.DownloadConcurrency)
 
 	// Send initial status message to Telegram
-	statusMsg := fmt.Sprintf("🚀 Task %s started\n📄 File: %s\n📦 Total Size: %.2f MB\n🧩 Chunks: %d (part size: %d MB)",
+	statusMsg := fmt.Sprintf("🚀 Задача %s начата\n📄 Файл: `%s`\n📦 Размер: %.2f MB\n🧩 Частей: %d (по %d MB)",
 		taskID, info.Filename, float64(info.Size)/(1024*1024), totalParts, o.cfg.ChunkSizeMB)
 	_, _ = o.tgClient.SendTextMessage(ctx, statusMsg)
 
@@ -93,10 +102,14 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 		chunkName := fmt.Sprintf("%s.part_%04d", info.Filename, i)
 		tempFilePath := filepath.Join(o.cfg.TempDir, fmt.Sprintf("%s_part_%04d.tmp", taskID, i))
 
-		log.Printf("[Task %s] Downloading part %d/%d (%d MB) using %d parallel streams...",
-			taskID, i+1, totalParts, partSize/(1024*1024), o.cfg.DownloadConcurrency)
+		// ---------------------------------------------------------------------
+		// STEP 1: PARALLEL SEGMENTED DOWNLOAD (Origin -> VPS)
+		// ---------------------------------------------------------------------
+		downTracker := newProgressTracker(taskID, "Downloader", i+1, totalParts, partSize)
+		log.Printf("[Task %s] [Downloader] ⏳ Starting Part %d/%d (%.2f MB, bytes %d-%d) using %d parallel streams...",
+			taskID, i+1, totalParts, float64(partSize)/(1024*1024), startByte, endByte, o.cfg.DownloadConcurrency)
 
-		// 1. Download chunk via parallel HTTP Range requests
+		downStart := time.Now()
 		md5Hash, err := o.downloader.DownloadRangeParallel(
 			ctx,
 			fileURL,
@@ -104,29 +117,53 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 			endByte,
 			tempFilePath,
 			o.cfg.DownloadConcurrency,
-			nil,
+			func(written, total int64) {
+				downTracker.Update(written)
+			},
 		)
 		if err != nil {
 			_ = os.Remove(tempFilePath)
-			return nil, fmt.Errorf("failed downloading part %d: %w", i, err)
+			log.Printf("[Task %s] [Downloader] ❌ Error downloading part %d/%d after %v: %v",
+				taskID, i+1, totalParts, time.Since(downStart).Round(100*time.Millisecond), err)
+			return nil, fmt.Errorf("failed downloading part %d: %w", i+1, err)
 		}
 
-		log.Printf("[Task %s] Part %d/%d downloaded (MD5: %s). Uploading to Telegram...",
-			taskID, i+1, totalParts, md5Hash)
+		downDuration := time.Since(downStart)
+		downSpeedMBs := (float64(partSize) / (1024 * 1024)) / downDuration.Seconds()
+		downTracker.Finish(fmt.Sprintf(", Speed: %.2f MB/s, MD5: %s", downSpeedMBs, md5Hash))
 
-		// 2. Upload chunk to Telegram via MTProto
+		// ---------------------------------------------------------------------
+		// STEP 2: TELEGRAM MTPROTO UPLOAD (VPS -> Telegram Channel)
+		// ---------------------------------------------------------------------
+		upTracker := newProgressTracker(taskID, "Telegram", i+1, totalParts, partSize)
+		log.Printf("[Task %s] [Telegram] ⏳ Uploading Part %d/%d (%.2f MB, blocks: %d KB, threads: %d)...",
+			taskID, i+1, totalParts, float64(partSize)/(1024*1024), o.cfg.UploadPartSizeKB, o.cfg.UploadThreads)
+
+		upStart := time.Now()
 		caption := fmt.Sprintf("#task_%s #part_%04d_of_%04d\n%s", taskID, i+1, totalParts, chunkName)
-		msgID, err := o.tgClient.UploadChunk(ctx, tempFilePath, chunkName, caption)
+		msgID, err := o.tgClient.UploadChunk(ctx, tempFilePath, chunkName, caption, func(uploaded, total int64) {
+			upTracker.Update(uploaded)
+		})
 
-		// 3. CRITICAL: Remove temp file immediately to keep VPS disk free!
+		// ---------------------------------------------------------------------
+		// STEP 3: IMMEDIATE DISK CLEANUP (Strict FIFO chunk buffer)
+		// ---------------------------------------------------------------------
 		_ = os.Remove(tempFilePath)
 
 		if err != nil {
-			return nil, fmt.Errorf("failed uploading part %d: %w", i, err)
+			log.Printf("[Task %s] [Telegram] ❌ Error uploading part %d/%d after %v: %v",
+				taskID, i+1, totalParts, time.Since(upStart).Round(100*time.Millisecond), err)
+			return nil, fmt.Errorf("failed uploading part %d: %w", i+1, err)
 		}
 
-		log.Printf("[Task %s] Part %d/%d successfully uploaded (MsgID: %d). Disk chunk removed.",
-			taskID, i+1, totalParts, msgID)
+		upDuration := time.Since(upStart)
+		upSpeedMBs := (float64(partSize) / (1024 * 1024)) / upDuration.Seconds()
+		upTracker.Finish(fmt.Sprintf(", Speed: %.2f MB/s, MsgID: %d. Disk chunk purged", upSpeedMBs, msgID))
+
+		// Telegram channel notification per part
+		partDoneMsg := fmt.Sprintf("🧩 Часть %d/%d (%.1f MB) отправлена (скачано: %.1f MB/s, залито: %.1f MB/s)",
+			i+1, totalParts, float64(partSize)/(1024*1024), downSpeedMBs, upSpeedMBs)
+		_, _ = o.tgClient.SendTextMessage(ctx, partDoneMsg)
 
 		m.Parts = append(m.Parts, manifest.PartInfo{
 			Index:     i,
@@ -138,16 +175,91 @@ func (o *Orchestrator) ProcessURL(ctx context.Context, fileURL string) (*manifes
 		})
 	}
 
-	// 4. Send Manifest JSON to Telegram
+	// -------------------------------------------------------------------------
+	// STEP 4: TASK COMPLETION & MANIFEST PUBLISHING
+	// -------------------------------------------------------------------------
+	overallDuration := time.Since(overallStartTime)
+	overallSpeedMBs := (float64(info.Size) / (1024 * 1024)) / overallDuration.Seconds()
+
+	log.Printf("[Task %s] 🎉 SUCCESS! All %d parts completed in %v! Pipeline throughput: %.2f MB/s",
+		taskID, totalParts, overallDuration.Round(100*time.Millisecond), overallSpeedMBs)
+
 	manifestBytes, _ := json.MarshalIndent(m, "", "  ")
-	manifestText := fmt.Sprintf("✅ Task %s COMPLETE!\n\n```json\n%s\n```", taskID, string(manifestBytes))
+	manifestText := fmt.Sprintf("✅ Задача %s ПОЛНОСТЬЮ ВЫПОЛНЕНА!\n📄 Файл: `%s`\n⏱ Общее время: %v (средняя скорость: %.1f MB/s)\n\n```json\n%s\n```",
+		taskID, info.Filename, overallDuration.Round(time.Second), overallSpeedMBs, string(manifestBytes))
 	_, _ = o.tgClient.SendTextMessage(ctx, manifestText)
 
-	// Also save manifest locally in TempDir for easy access
+	// Save manifest locally in TempDir
 	_ = m.SaveToFile(filepath.Join(o.cfg.TempDir, fmt.Sprintf("%s_manifest.json", taskID)))
 
-	log.Printf("[Task %s] All %d parts successfully processed and uploaded!", taskID, totalParts)
 	return m, nil
+}
+
+// ProgressTracker manages throttled progress logging with live transfer speed and ETA calculations.
+type ProgressTracker struct {
+	taskID     string
+	stage      string
+	partIdx    int
+	totalParts int
+	totalBytes int64
+	startTime  time.Time
+	lastLog    time.Time
+	mu         sync.Mutex
+}
+
+func newProgressTracker(taskID, stage string, partIdx, totalParts int, totalBytes int64) *ProgressTracker {
+	now := time.Now()
+	return &ProgressTracker{
+		taskID:     taskID,
+		stage:      stage,
+		partIdx:    partIdx,
+		totalParts: totalParts,
+		totalBytes: totalBytes,
+		startTime:  now,
+		lastLog:    now,
+	}
+}
+
+func (p *ProgressTracker) Update(written int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	// Throttle logs to every 2 seconds to keep logs clean and readable
+	if now.Sub(p.lastLog) < 2*time.Second {
+		return
+	}
+
+	elapsed := now.Sub(p.startTime).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+
+	speedMBs := (float64(written) / (1024 * 1024)) / elapsed
+	pct := float64(written) / float64(p.totalBytes) * 100.0
+
+	var etaStr string
+	remainingBytes := p.totalBytes - written
+	if speedMBs > 0 && remainingBytes > 0 {
+		etaSec := float64(remainingBytes) / (speedMBs * 1024 * 1024)
+		etaStr = fmt.Sprintf("ETA: %.0fs", etaSec)
+	} else {
+		etaStr = "ETA: --"
+	}
+
+	log.Printf("[Task %s] [%s] Part %d/%d: %.1f MB / %.1f MB (%.1f%%) | Speed: %.1f MB/s | %s",
+		p.taskID, p.stage, p.partIdx, p.totalParts,
+		float64(written)/(1024*1024), float64(p.totalBytes)/(1024*1024),
+		pct, speedMBs, etaStr)
+
+	p.lastLog = now
+}
+
+func (p *ProgressTracker) Finish(extraInfo string) {
+	dur := time.Since(p.startTime)
+	log.Printf("[Task %s] [%s] ✅ Part %d/%d finished in %v%s",
+		p.taskID, p.stage, p.partIdx, p.totalParts,
+		dur.Round(100*time.Millisecond), extraInfo)
 }
 
 func generateTaskID() string {

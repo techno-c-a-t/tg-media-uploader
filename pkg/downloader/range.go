@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -401,11 +402,15 @@ func (c *Client) downloadSegmentWithRetry(
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			log.Printf("[Stream %s] ⚠️ Attempt %d/%d network error: %v. Retrying...", rangeHeader, attempt+1, maxRetries, err)
 			continue
 		}
 
 		if resp.StatusCode != http.StatusPartialContent {
 			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusForbidden {
+				return fmt.Errorf("HTTP 403 Forbidden for range %s (remote URL signature/token has expired!)", rangeHeader)
+			}
 			return fmt.Errorf("unexpected status %d for range %s", resp.StatusCode, rangeHeader)
 		}
 
@@ -446,6 +451,8 @@ func (c *Client) downloadSegmentWithRetry(
 		}
 
 		lastErr = readLoopErr
+		log.Printf("[Stream %s] ⚠️ Read interrupted at byte %d (%v). Resuming next attempt from byte %d...",
+			rangeHeader, curStart, readLoopErr, curStart)
 		// If read broke midway, curStart and curOffset have advanced, so next retry continues where it left off!
 	}
 

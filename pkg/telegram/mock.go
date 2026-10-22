@@ -11,7 +11,7 @@ import (
 // Uploader defines the interface for sending messages and files to Telegram.
 type Uploader interface {
 	SendTextMessage(ctx context.Context, text string) (int, error)
-	UploadChunk(ctx context.Context, filePath, filename, caption string) (int, error)
+	UploadChunk(ctx context.Context, filePath, filename, caption string, onProgress func(uploaded, total int64)) (int, error)
 }
 
 // MockUploader simulates Telegram uploads for local testing without real credentials.
@@ -34,7 +34,7 @@ func (m *MockUploader) SendTextMessage(ctx context.Context, text string) (int, e
 	return m.counter, nil
 }
 
-func (m *MockUploader) UploadChunk(ctx context.Context, filePath, filename, caption string) (int, error) {
+func (m *MockUploader) UploadChunk(ctx context.Context, filePath, filename, caption string, onProgress func(uploaded, total int64)) (int, error) {
 	log.Printf("[MockTG Upload] Saving chunk %s to simulated channel %s...", filename, m.OutputDir)
 	if m.OutputDir != "" {
 		dest := filepath.Join(m.OutputDir, filename)

@@ -154,13 +154,29 @@ func (c *Client) handleMessage(ctx context.Context, e tg.Entities, u message.Ans
 	}
 }
 
+type progressFunc func(ctx context.Context, state uploader.ProgressState) error
+
+func (f progressFunc) Chunk(ctx context.Context, state uploader.ProgressState) error {
+	return f(ctx, state)
+}
+
 // UploadChunk uploads a chunk file to Telegram and returns the sent message ID.
-func (c *Client) UploadChunk(ctx context.Context, filePath, filename, caption string) (int, error) {
+func (c *Client) UploadChunk(ctx context.Context, filePath, filename, caption string, onProgress func(uploaded, total int64)) (int, error) {
 	if _, err := os.Stat(filePath); err != nil {
 		return 0, fmt.Errorf("chunk file not found: %w", err)
 	}
 
-	upload, err := c.up.FromPath(ctx, filePath)
+	up := c.up
+	if onProgress != nil {
+		up = up.WithProgress(progressFunc(func(ctx context.Context, state uploader.ProgressState) error {
+			if state.Total > 0 {
+				onProgress(state.Uploaded, state.Total)
+			}
+			return nil
+		}))
+	}
+
+	upload, err := up.FromPath(ctx, filePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to upload chunk to MTProto: %w", err)
 	}
