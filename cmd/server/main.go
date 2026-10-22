@@ -122,6 +122,26 @@ func main() {
 		log.Fatalf("Failed to initialize Telegram client: %v", err)
 	}
 
+	tgClient.SetURLHandler(func(handlerCtx context.Context, targetURL string, reply func(text string)) {
+		log.Printf("[Bot Listener] Received download request via Telegram: %s", targetURL)
+		reply(fmt.Sprintf("🚀 Задача принята!\nФайл: %s\nНачинаю скачивание на VPS и выгрузку в канал...", targetURL))
+
+		go func() {
+			taskCtx, taskCancel := context.WithCancel(context.Background())
+			defer taskCancel()
+
+			orch := pipeline.NewOrchestrator(cfg, tgClient)
+			m, err := orch.ProcessURL(taskCtx, targetURL)
+			if err != nil {
+				log.Printf("[Bot Listener] Task error: %v", err)
+				reply(fmt.Sprintf("❌ Ошибка: %v", err))
+				return
+			}
+			reply(fmt.Sprintf("🎉 Готово! Файл '%s' (%.2f MB, %d частей) успешно загружен в канал!",
+				m.Filename, float64(m.TotalSize)/(1024*1024), len(m.Parts)))
+		}()
+	})
+
 	err = tgClient.Start(ctx, func(clientCtx context.Context) error {
 		return runServer(clientCtx, tgClient)
 	})

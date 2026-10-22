@@ -24,13 +24,23 @@ type Config struct {
 	TargetPeer  string // e.g. "@my_private_channel" or empty for Saved Messages
 }
 
+// URLHandler is called when a URL is sent to the bot.
+type URLHandler func(ctx context.Context, targetURL string, reply func(text string))
+
 // Client wraps gotd/td Telegram MTProto client.
 type Client struct {
-	cfg    Config
-	client *telegram.Client
-	rawAPI *tg.Client
-	sender *message.Sender
-	up     *uploader.Uploader
+	cfg        Config
+	client     *telegram.Client
+	rawAPI     *tg.Client
+	sender     *message.Sender
+	up         *uploader.Uploader
+	dispatcher tg.UpdateDispatcher
+	onURL      URLHandler
+}
+
+// SetURLHandler registers a handler for URLs received in Telegram chat.
+func (c *Client) SetURLHandler(h URLHandler) {
+	c.onURL = h
 }
 
 // NewClient initializes a Telegram client.
@@ -39,18 +49,24 @@ func NewClient(cfg Config) (*Client, error) {
 		cfg.SessionFile = "tg_session.json"
 	}
 
+	dispatcher := tg.NewUpdateDispatcher()
+
 	opts := telegram.Options{
 		SessionStorage: &session.FileStorage{
 			Path: cfg.SessionFile,
 		},
+		UpdateHandler: dispatcher,
 	}
 
 	client := telegram.NewClient(cfg.AppID, cfg.AppHash, opts)
 
-	return &Client{
-		cfg:    cfg,
-		client: client,
-	}, nil
+	c := &Client{
+		cfg:        cfg,
+		client:     client,
+		dispatcher: dispatcher,
+	}
+
+	return c, nil
 }
 
 // Start connects to Telegram, authenticates, and invokes the worker function.
@@ -73,8 +89,58 @@ func (c *Client) Start(ctx context.Context, f func(ctx context.Context) error) e
 		c.sender = message.NewSender(c.rawAPI)
 		c.up = uploader.NewUploader(c.rawAPI).WithPartSize(512 * 1024) // 512 KB chunks for MTProto upload
 
+		// Register message handlers
+		c.dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+			if msg, ok := u.Message.(*tg.Message); ok && !msg.Out {
+				c.handleMessage(ctx, e, u, msg.Message)
+			}
+			return nil
+		})
+
+		c.dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+			if msg, ok := u.Message.(*tg.Message); ok && !msg.Out {
+				c.handleMessage(ctx, e, u, msg.Message)
+			}
+			return nil
+		})
+
 		return f(ctx)
 	})
+}
+
+func (c *Client) handleMessage(ctx context.Context, e tg.Entities, u message.AnswerableMessageUpdate, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+
+	replyFunc := func(replyText string) {
+		if c.sender != nil {
+			_, _ = c.sender.Answer(e, u).Text(ctx, replyText)
+		}
+	}
+
+	if strings.HasPrefix(text, "/start") {
+		replyFunc("👋 Привет! Я бот для быстрой загрузки больших файлов.\n\nПросто отправь мне прямую ссылку (начинается с http:// или https://) или команду:\n/dl <ссылка>\n\nЯ скачаю файл чанками на VPS и выгружу в ваш канал!")
+		return
+	}
+
+	var targetURL string
+	if strings.HasPrefix(text, "/dl ") || strings.HasPrefix(text, "/download ") {
+		fields := strings.Fields(text)
+		if len(fields) >= 2 {
+			targetURL = fields[1]
+		}
+	} else if strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") {
+		fields := strings.Fields(text)
+		if len(fields) > 0 {
+			targetURL = fields[0]
+		}
+	}
+
+	if targetURL != "" && c.onURL != nil {
+		c.onURL(ctx, targetURL, replyFunc)
+	}
 }
 
 // UploadChunk uploads a chunk file to Telegram and returns the sent message ID.
