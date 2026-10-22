@@ -8,8 +8,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - TG_APP_ID=${TG_APP_ID}
-      - TG_APP_HASH=${TG_APP_HASH}
+      - TG_APP_ID=${TG_APP_ID:-${API_ID}}
+      - TG_APP_HASH=${TG_APP_HASH:-${API_HASH}}
+      - API_ID=${API_ID:-${TG_APP_ID}}
+      - API_HASH=${API_HASH:-${TG_APP_HASH}}
       - TG_BOT_TOKEN=${TG_BOT_TOKEN}
       - TG_PEER=${TG_PEER:-self}
       - CHUNK_SIZE_MB=${CHUNK_SIZE_MB:-500}

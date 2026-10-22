@@ -5,10 +5,10 @@
 *session*.json
 tg_session.json*
 
-# Binaries
-tg_proxy
+# Binaries & local setup
 tg-assembler
 mock_http
+setup_git_ssh.sh
 bin/
 
 # Temporary files and test artifacts
