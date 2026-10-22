@@ -1,0 +1,25 @@
+# Environment and secrets (CRITICAL: never commit real tokens!)
+.env
+*.session
+*.session-journal
+*session*.json
+tg_session.json*
+
+# Binaries
+tg_proxy
+tg-assembler
+mock_http
+bin/
+
+# Temporary files and test artifacts
+*.tmp
+*.bin
+*.iso
+*.part*
+simulated_tg_channel/
+data/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store

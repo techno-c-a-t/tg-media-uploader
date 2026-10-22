@@ -1,0 +1,11 @@
+tg_proxy
+tg-assembler
+mock_http
+*.iso
+*.bin
+*.tmp
+simulated_tg_channel/
+data/
+.git/
+.env
+tg_session.json

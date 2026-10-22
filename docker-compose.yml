@@ -1,0 +1,31 @@
+services:
+  tg_proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg_file_proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - TG_APP_ID=${TG_APP_ID}
+      - TG_APP_HASH=${TG_APP_HASH}
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - TG_PEER=${TG_PEER:-self}
+      - CHUNK_SIZE_MB=${CHUNK_SIZE_MB:-500}
+      - HTTP_PORT=8080
+      - TEMP_DIR=/tmp/tg_file_proxy
+    volumes:
+      - ./tg_session.json:/app/tg_session.json
+      - tg_chunk_cache:/tmp/tg_file_proxy
+    # Strict resource isolation: 300MB RAM limit, leaves 3.7GB for friend & system
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+          cpus: "0.85"
+        reservations:
+          memory: 40M
+
+volumes:
+  tg_chunk_cache:
